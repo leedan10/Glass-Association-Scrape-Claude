@@ -1,0 +1,37 @@
+name: Scrape NGA Members
+
+on:
+  workflow_dispatch:   # Manual trigger from GitHub Actions UI
+  schedule:
+    - cron: '0 6 1 * *'   # Monthly on the 1st at 6:00 AM UTC
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
+
+      - name: Run scraper
+        run: python scraper.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nga-members-${{ github.run_id }}
+          path: output/
+          retention-days: 90
