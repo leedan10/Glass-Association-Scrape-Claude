@@ -6,15 +6,14 @@ Scrapes member data from https://members.glass.org using Playwright
 and exports to CSV and XLSX formats.
 
 Strategy:
-  Phase 1 — Use JavaScript DOM evaluation to extract table data from all
-            paginated result pages (Name, Classification, Address, City,
-            State, Phone, detail URL).
+  Phase 1 — Submit the search form, then use URL-based Range pagination
+            to iterate through all result pages. Extract table data via
+            JavaScript DOM evaluation.
   Phase 2 — Visit each member detail page to extract Web Address.
   Phase 3 — Export to CSV and XLSX.
 """
 
 import csv
-import json
 import logging
 import os
 import re
@@ -62,156 +61,6 @@ def retry(func, retries=RETRY_COUNT, backoff=RETRY_BACKOFF):
             time.sleep(wait)
 
 
-# JavaScript that runs inside the browser to extract table rows.
-# This handles nested tables, mixed th/td, and any cvweb layout quirks.
-JS_EXTRACT_TABLE = """
-() => {
-    // Find all tables on the page
-    const tables = document.querySelectorAll('table');
-    let dataRows = [];
-
-    for (const table of tables) {
-        const rows = table.querySelectorAll('tr');
-        for (const row of rows) {
-            // Get all cells (td or th)
-            const cells = Array.from(row.querySelectorAll('td, th'));
-            if (cells.length < 5) continue;
-
-            // Read text from each cell
-            const texts = cells.map(c => (c.innerText || '').trim());
-
-            // Skip header rows: look for rows where first cell is "Name" or similar
-            const first = texts[0].toLowerCase();
-            if (first === 'name' || first === 'organization' || first === '' ||
-                first === 'company' || first.includes('▼') || first.includes('▲'))
-                continue;
-
-            // Skip rows that look like pagination or footer
-            if (texts[0].match(/^\\d+$/) || texts[0].includes('Page') ||
-                texts[0].includes('Match') || texts[0].includes('MATCH'))
-                continue;
-
-            // Try to get a link from the first cell (member name)
-            let detailUrl = '';
-            const link = cells[0].querySelector('a[href]');
-            if (link) {
-                detailUrl = link.href || '';
-            }
-
-            // Build the record: Name, Classification, Address, CityState, Phone
-            dataRows.push({
-                name: texts[0],
-                classification: texts[1] || '',
-                address: texts[2] || '',
-                cityState: texts[3] || '',
-                phone: texts[4] || '',
-                detailUrl: detailUrl
-            });
-        }
-    }
-
-    // Deduplicate by name+address (in case layout tables cause duplicates)
-    const seen = new Set();
-    const unique = [];
-    for (const row of dataRows) {
-        const key = row.name + '|' + row.address;
-        if (!seen.has(key) && row.name.length > 0) {
-            seen.add(key);
-            unique.push(row);
-        }
-    }
-
-    return unique;
-}
-"""
-
-# JavaScript to find and click the next-page arrow
-JS_CLICK_NEXT = """
-() => {
-    // Look for pagination links: →, ›, Next, >>
-    const allLinks = document.querySelectorAll('a');
-    for (const a of allLinks) {
-        const text = (a.innerText || '').trim();
-        if (text === '→' || text === '›' || text === '»' ||
-            text === '>>' || text.toLowerCase() === 'next') {
-            a.click();
-            return true;
-        }
-    }
-    // Also check for input buttons
-    const buttons = document.querySelectorAll('input[type="button"], input[type="submit"]');
-    for (const btn of buttons) {
-        const val = (btn.value || '').trim().toLowerCase();
-        if (val === 'next' || val === '>' || val === '>>') {
-            btn.click();
-            return true;
-        }
-    }
-    return false;
-}
-"""
-
-# JavaScript to extract the web address from a detail page
-JS_EXTRACT_WEB_ADDRESS = """
-() => {
-    const body = document.body.innerText || '';
-
-    // Strategy 1: Look for "Web Address" or "Website" label followed by a URL
-    const labels = ['Web Address', 'Website', 'Web Site', 'URL', 'Home Page', 'Web'];
-    for (const label of labels) {
-        // Find in table cells: <td>Label</td><td>value</td>
-        const allCells = document.querySelectorAll('td, th');
-        for (let i = 0; i < allCells.length; i++) {
-            const cellText = (allCells[i].innerText || '').trim();
-            if (cellText.toLowerCase().replace(/[:\\s]/g, '') === label.toLowerCase().replace(/[:\\s]/g, '')) {
-                // Check the next sibling cell
-                const next = allCells[i + 1] || allCells[i].nextElementSibling;
-                if (next) {
-                    // First check for a link
-                    const link = next.querySelector('a[href]');
-                    if (link && link.href && !link.href.includes('glass.org') && !link.href.includes('mailto:')) {
-                        return link.href;
-                    }
-                    // Then check text content
-                    const txt = (next.innerText || '').trim();
-                    if (txt && txt.includes('.') && !txt.includes(' ') && txt.length > 3) {
-                        return txt.startsWith('http') ? txt : 'http://' + txt;
-                    }
-                }
-            }
-        }
-    }
-
-    // Strategy 2: Find "Web Address" in body text followed by URL-like text
-    for (const label of labels) {
-        const regex = new RegExp(label + '[:\\\\s]*([\\\\S]+\\\\.[\\\\S]+)', 'i');
-        const match = body.match(regex);
-        if (match && match[1] && match[1].includes('.') && !match[1].includes('glass.org')) {
-            const url = match[1].replace(/[,;)]+$/, '');
-            return url.startsWith('http') ? url : 'http://' + url;
-        }
-    }
-
-    // Strategy 3: Find external links not pointing to glass.org
-    const skipDomains = ['glass.org', 'google.com', 'facebook.com', 'twitter.com',
-                         'linkedin.com', 'youtube.com', 'instagram.com', 'bing.com',
-                         'javascript:', 'mailto:'];
-    const links = document.querySelectorAll('a[href]');
-    for (const link of links) {
-        const href = link.href || '';
-        if (!href.startsWith('http')) continue;
-        let dominated = false;
-        for (const skip of skipDomains) {
-            if (href.includes(skip)) { dominated = true; break; }
-        }
-        if (!dominated) return href;
-    }
-
-    return '';
-}
-"""
-
-
 def split_city_state(city_state_text):
     """Split 'City, ST' or 'City, ST 12345' into (city, state)."""
     text = city_state_text.strip()
@@ -224,6 +73,141 @@ def split_city_state(city_state_text):
 
 
 # ---------------------------------------------------------------------------
+# JavaScript snippets executed inside the browser
+# ---------------------------------------------------------------------------
+
+# Extract table data rows from the page.  Handles nested tables, mixed
+# th/td cells, and cvweb layout quirks.
+JS_EXTRACT_TABLE = """
+() => {
+    const tables = document.querySelectorAll('table');
+    let dataRows = [];
+
+    for (const table of tables) {
+        const rows = table.querySelectorAll('tr');
+        for (const row of rows) {
+            const cells = Array.from(row.querySelectorAll('td, th'));
+            if (cells.length < 5) continue;
+
+            const texts = cells.map(c => (c.innerText || '').trim());
+
+            // Skip header/nav/empty rows
+            const first = texts[0].toLowerCase();
+            if (!first || first === 'name' || first === 'organization' ||
+                first === 'company' || first.includes('\\u25bc') ||
+                first.includes('\\u25b2'))
+                continue;
+            if (/^\\d+$/.test(texts[0]) || texts[0].includes('Page') ||
+                texts[0].includes('Match') || texts[0].includes('MATCH'))
+                continue;
+
+            let detailUrl = '';
+            const link = cells[0].querySelector('a[href]');
+            if (link) detailUrl = link.href || '';
+
+            dataRows.push({
+                name: texts[0],
+                classification: texts[1] || '',
+                address: texts[2] || '',
+                cityState: texts[3] || '',
+                phone: texts[4] || '',
+                detailUrl: detailUrl
+            });
+        }
+    }
+
+    // Deduplicate
+    const seen = new Set();
+    const unique = [];
+    for (const row of dataRows) {
+        const key = row.name + '|' + row.address;
+        if (!seen.has(key) && row.name.length > 0) {
+            seen.add(key);
+            unique.push(row);
+        }
+    }
+    return unique;
+}
+"""
+
+# Get the href of the next-page link (don't click — just return the URL).
+JS_GET_NEXT_PAGE_URL = """
+() => {
+    const arrows = ['\\u2192', '\\u203a', '\\u00bb', '>>', '\\u25b6', 'Next', 'next'];
+    const allLinks = document.querySelectorAll('a[href]');
+    for (const a of allLinks) {
+        const text = (a.innerText || '').trim();
+        for (const arrow of arrows) {
+            if (text === arrow || text.toLowerCase() === arrow.toLowerCase()) {
+                return a.href;
+            }
+        }
+    }
+    return '';
+}
+"""
+
+# Extract the total match count from page text, e.g. "2106 MATCH(ES)"
+JS_GET_MATCH_COUNT = """
+() => {
+    const body = document.body.innerText || '';
+    const m = body.match(/(\\d[\\d,]*)\\s*MATCH/i);
+    return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0;
+}
+"""
+
+# Extract the web address from a member detail page.
+JS_EXTRACT_WEB_ADDRESS = """
+() => {
+    const body = document.body.innerText || '';
+    const labels = ['Web Address', 'Website', 'Web Site', 'URL', 'Home Page', 'Web'];
+
+    // Strategy 1: table-cell label/value pairs
+    for (const label of labels) {
+        const allCells = document.querySelectorAll('td, th');
+        for (let i = 0; i < allCells.length; i++) {
+            const cellText = (allCells[i].innerText || '').trim()
+                              .replace(/[:]/g, '').trim().toLowerCase();
+            if (cellText === label.toLowerCase()) {
+                const next = allCells[i + 1] || allCells[i].nextElementSibling;
+                if (next) {
+                    const link = next.querySelector('a[href]');
+                    if (link && link.href && !link.href.includes('glass.org') &&
+                        !link.href.includes('mailto:')) {
+                        return link.href;
+                    }
+                    const txt = (next.innerText || '').trim();
+                    if (txt && txt.includes('.') && !txt.includes(' ') && txt.length > 3) {
+                        return txt.startsWith('http') ? txt : 'http://' + txt;
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy 2: regex in body text
+    for (const label of labels) {
+        const re = new RegExp(label + '[:\\\\-]?\\\\s*(https?://[^\\\\s]+)', 'i');
+        const m = body.match(re);
+        if (m) return m[1].replace(/[,;)]+$/, '');
+    }
+
+    // Strategy 3: any external link not to glass.org / social / maps
+    const skip = ['glass.org', 'google.com', 'facebook.com', 'twitter.com',
+                  'linkedin.com', 'youtube.com', 'instagram.com', 'bing.com',
+                  'javascript:', 'mailto:'];
+    for (const a of document.querySelectorAll('a[href]')) {
+        const href = a.href || '';
+        if (!href.startsWith('http')) continue;
+        if (skip.some(s => href.includes(s))) continue;
+        return href;
+    }
+    return '';
+}
+"""
+
+
+# ---------------------------------------------------------------------------
 # Phase 1: Collect all members from paginated results
 # ---------------------------------------------------------------------------
 def collect_all_members(page):
@@ -232,9 +216,7 @@ def collect_all_members(page):
     log.info("Navigating to search page: %s", SEARCH_URL)
     retry(lambda: page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT))
     page.wait_for_timeout(3000)
-
-    title = page.title()
-    log.info("Page title: %s", title)
+    log.info("Page title: %s", page.title())
 
     # Submit the search form
     submit_selectors = [
@@ -248,104 +230,152 @@ def collect_all_members(page):
         "a:has-text('Search')",
         "input[type='image']",
     ]
-
     submitted = False
     for sel in submit_selectors:
         try:
             btn = page.locator(sel).first
             if btn.count() and btn.is_visible():
-                log.info("Clicking submit element: %s", sel)
+                log.info("Clicking submit: %s", sel)
                 btn.click(timeout=5000)
-                page.wait_for_timeout(4000)
+                page.wait_for_timeout(5000)
                 submitted = True
                 break
         except Exception:
             continue
-
     if not submitted:
         try:
             first_input = page.locator("input[type='text']").first
             if first_input.count():
                 first_input.press("Enter")
-                page.wait_for_timeout(4000)
+                page.wait_for_timeout(5000)
                 submitted = True
                 log.info("Pressed Enter on first text input.")
         except Exception:
             pass
-
     if not submitted:
         log.warning("Could not find submit button. Parsing current page anyway.")
 
-    # Save first-page screenshot for debugging
+    # Save page 1 debug files
     page.screenshot(path=os.path.join(OUTPUT_DIR, "results_page1.png"), full_page=True)
-
-    # Also dump raw HTML for debugging
     with open(os.path.join(OUTPUT_DIR, "results_page1.html"), "w", encoding="utf-8") as f:
         f.write(page.content())
-    log.info("Saved results_page1.html for debugging.")
 
-    # Paginate through all result pages
-    page_num = 0
-    max_pages = 200
+    # Get total match count and current URL
+    total_matches = page.evaluate(JS_GET_MATCH_COUNT)
+    log.info("Total matches reported by page: %d", total_matches)
 
-    while page_num < max_pages:
-        page_num += 1
-        log.info("Parsing results page %d …", page_num)
+    current_url = page.url
+    log.info("Results URL: %s", current_url)
 
-        # Use JavaScript to extract table data
-        raw_rows = page.evaluate(JS_EXTRACT_TABLE)
-        log.info("  JS extraction returned %d rows", len(raw_rows))
+    # --- Determine pagination strategy ---
+    # Check if URL already has a Range parameter
+    range_match = re.search(r"Range=(\d+)/(\d+)", current_url, re.IGNORECASE)
+    if range_match:
+        page_size = int(range_match.group(2))
+    else:
+        page_size = 25  # default cvweb page size
 
-        if raw_rows:
-            for row in raw_rows:
-                city, state = split_city_state(row.get("cityState", ""))
-                record = {
-                    "Name": row.get("name", ""),
-                    "Classification": row.get("classification", ""),
-                    "Address": row.get("address", ""),
-                    "City": city,
-                    "State": state,
-                    "Phone": row.get("phone", ""),
-                    "Web Address": "",
-                    "_detail_url": row.get("detailUrl", ""),
-                }
-                all_members.append(record)
+    # Also try to get the next-page URL from the → link
+    next_url_from_link = page.evaluate(JS_GET_NEXT_PAGE_URL)
+    log.info("Next-page URL from arrow link: %s", next_url_from_link or "(none)")
 
-            log.info("  Collected %d members on page %d (total: %d)",
-                     len(raw_rows), page_num, len(all_members))
-        else:
-            log.info("  No data rows on page %d.", page_num)
-            if page_num == 1:
-                page.screenshot(path=os.path.join(OUTPUT_DIR, "debug_screenshot.png"), full_page=True)
-                with open(os.path.join(OUTPUT_DIR, "debug_page.html"), "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                log.error("No data on first page. Debug files saved.")
+    # If we got a next-page URL, extract the Range pattern from it
+    if next_url_from_link:
+        nm = re.search(r"Range=(\d+)/(\d+)", next_url_from_link, re.IGNORECASE)
+        if nm:
+            page_size = int(nm.group(2))
+            log.info("Detected page size from next link: %d", page_size)
+
+    # Calculate total pages
+    if total_matches > 0:
+        total_pages = (total_matches + page_size - 1) // page_size
+    else:
+        total_pages = 200  # safety fallback
+    log.info("Expected pages: %d (page_size=%d)", total_pages, page_size)
+
+    # --- Scrape page 1 ---
+    raw_rows = page.evaluate(JS_EXTRACT_TABLE)
+    log.info("Page 1: JS extraction returned %d rows", len(raw_rows))
+
+    if not raw_rows:
+        page.screenshot(path=os.path.join(OUTPUT_DIR, "debug_screenshot.png"), full_page=True)
+        with open(os.path.join(OUTPUT_DIR, "debug_page.html"), "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log.error("No data on page 1. Debug files saved.")
+        return all_members
+
+    for row in raw_rows:
+        city, state = split_city_state(row.get("cityState", ""))
+        all_members.append({
+            "Name": row.get("name", ""),
+            "Classification": row.get("classification", ""),
+            "Address": row.get("address", ""),
+            "City": city,
+            "State": state,
+            "Phone": row.get("phone", ""),
+            "Web Address": "",
+            "_detail_url": row.get("detailUrl", ""),
+        })
+    log.info("Page 1: collected %d members", len(all_members))
+
+    # --- Determine base URL for pagination ---
+    # Use the next-page link as a template if available; otherwise modify
+    # the current URL.
+    if next_url_from_link and "Range=" in next_url_from_link:
+        base_pagination_url = next_url_from_link
+    elif "Range=" in current_url:
+        base_pagination_url = current_url
+    else:
+        # Construct pagination URL from next-page link (full URL)
+        base_pagination_url = next_url_from_link if next_url_from_link else ""
+
+    if not base_pagination_url:
+        log.warning("Cannot determine pagination URL. Only page 1 data collected.")
+        return all_members
+
+    log.info("Base pagination URL: %s", base_pagination_url)
+
+    # --- Scrape pages 2 through N ---
+    for page_num in range(2, total_pages + 1):
+        range_start = (page_num - 1) * page_size + 1
+        # Replace the Range= parameter in the URL
+        page_url = re.sub(
+            r"Range=\d+/\d+",
+            f"Range={range_start}/{page_size}",
+            base_pagination_url,
+        )
+
+        log.info("Page %d/%d — navigating to Range=%d/%d …",
+                 page_num, total_pages, range_start, page_size)
+
+        try:
+            retry(lambda url=page_url: page.goto(url, wait_until="domcontentloaded",
+                                                  timeout=PAGE_LOAD_TIMEOUT))
+        except Exception as exc:
+            log.error("  Failed to load page %d: %s. Stopping.", page_num, exc)
             break
 
-        # Navigate to next page using JavaScript click
-        clicked = page.evaluate(JS_CLICK_NEXT)
-        if clicked:
-            page.wait_for_timeout(3000)
-            log.info("  Navigated to next page.")
-        else:
-            # Fallback: try URL Range parameter
-            current_url = page.url
-            range_match = re.search(r"Range=(\d+)/(\d+)", current_url, re.IGNORECASE)
-            if range_match:
-                start = int(range_match.group(1))
-                size = int(range_match.group(2))
-                next_start = start + size
-                next_url = re.sub(r"Range=\d+/\d+", f"Range={next_start}/{size}", current_url)
-                log.info("  Trying Range pagination: %s", next_url)
-                try:
-                    page.goto(next_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-                    page.wait_for_timeout(2000)
-                except Exception as exc:
-                    log.warning("  Range pagination failed: %s. Stopping.", exc)
-                    break
-            else:
-                log.info("No more pages. Stopping pagination.")
-                break
+        page.wait_for_timeout(1500)
+
+        raw_rows = page.evaluate(JS_EXTRACT_TABLE)
+        if not raw_rows:
+            log.info("  No rows on page %d. Stopping.", page_num)
+            break
+
+        for row in raw_rows:
+            city, state = split_city_state(row.get("cityState", ""))
+            all_members.append({
+                "Name": row.get("name", ""),
+                "Classification": row.get("classification", ""),
+                "Address": row.get("address", ""),
+                "City": city,
+                "State": state,
+                "Phone": row.get("phone", ""),
+                "Web Address": "",
+                "_detail_url": row.get("detailUrl", ""),
+            })
+
+        log.info("  Page %d: %d rows (total: %d)", page_num, len(raw_rows), len(all_members))
 
     log.info("Total members collected: %d", len(all_members))
     return all_members
@@ -357,16 +387,12 @@ def collect_all_members(page):
 def scrape_web_address(page, detail_url):
     if not detail_url:
         return ""
-
     try:
         retry(lambda: page.goto(detail_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT))
     except Exception as exc:
         log.warning("  Could not load detail page: %s", exc)
         return ""
-
     page.wait_for_timeout(500)
-
-    # Use JavaScript to extract the web address
     web = page.evaluate(JS_EXTRACT_WEB_ADDRESS)
     return (web or "").strip()
 
@@ -403,7 +429,6 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     with sync_playwright() as pw:
-        # Launch with stealth flags to avoid bot detection
         browser = pw.chromium.launch(
             headless=True,
             args=[
@@ -419,19 +444,19 @@ def main():
             ),
             viewport={"width": 1280, "height": 900},
         )
-        # Remove the webdriver flag that marks headless browsers
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => false})")
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => false})"
+        )
         page = context.new_page()
 
-        # Phase 1 – collect members from results table
+        # Phase 1
         members = collect_all_members(page)
-
         if not members:
             log.error("No members found. Check debug files in output/.")
             browser.close()
             return
 
-        # Phase 2 – visit detail pages for Web Address
+        # Phase 2
         total = len(members)
         log.info("=" * 60)
         log.info("Phase 2: Fetching Web Address from %d detail pages …", total)
@@ -443,25 +468,22 @@ def main():
             if not detail_url:
                 web_failed += 1
                 continue
-
-            if idx % 50 == 0 or idx == 1:
+            if idx % 100 == 0 or idx == 1:
                 log.info("[%d/%d] %s", idx, total, member["Name"])
-
             try:
                 web = scrape_web_address(page, detail_url)
                 member["Web Address"] = web
                 if web:
                     web_found += 1
             except Exception as exc:
-                log.warning("  Error fetching web address for %s: %s", member["Name"], exc)
+                log.warning("  Error: %s", exc)
                 web_failed += 1
-
             if idx < total:
                 time.sleep(DETAIL_DELAY)
 
         browser.close()
 
-    # Phase 3 – export
+    # Phase 3
     export_csv(members)
     export_xlsx(members)
 
