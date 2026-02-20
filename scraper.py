@@ -4,6 +4,12 @@ NGA (National Glass Association) Member Directory Scraper
 
 Scrapes member data from https://members.glass.org using Playwright
 and exports to CSV and XLSX formats.
+
+Strategy:
+  Phase 1 — Parse the results table across all paginated pages to collect
+            Name, Classification, Address, City, State, Phone, and detail links.
+  Phase 2 — Visit each member detail page to extract Web Address.
+  Phase 3 — Export to CSV and XLSX.
 """
 
 import csv
@@ -11,9 +17,8 @@ import logging
 import os
 import re
 import time
-from urllib.parse import urljoin
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright
 from openpyxl import Workbook
 
 # ---------------------------------------------------------------------------
@@ -21,7 +26,6 @@ from openpyxl import Workbook
 # ---------------------------------------------------------------------------
 BASE_URL = "https://members.glass.org/cvweb/cgi-bin/"
 SEARCH_URL = BASE_URL + "utilities.dll/OpenPage?wrp=ngaSearch.htm"
-MEMBER_URL_TEMPLATE = BASE_URL + "organizationdll.dll/Info?orgcd={orgcd}&wrp=organizationinfo.htm"
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 CSV_FILE = os.path.join(OUTPUT_DIR, "nga_members.csv")
@@ -29,8 +33,8 @@ XLSX_FILE = os.path.join(OUTPUT_DIR, "nga_members.xlsx")
 
 FIELDS = ["Name", "Classification", "Address", "City", "State", "Phone", "Web Address"]
 
-REQUEST_DELAY = 1.5          # seconds between detail-page requests
-PAGE_LOAD_TIMEOUT = 30_000   # ms
+DETAIL_DELAY = 0.5           # seconds between detail-page requests
+PAGE_LOAD_TIMEOUT = 45_000   # ms
 RETRY_COUNT = 3
 RETRY_BACKOFF = 2            # seconds, doubles each retry
 
@@ -57,60 +61,113 @@ def retry(func, retries=RETRY_COUNT, backoff=RETRY_BACKOFF):
             time.sleep(wait)
 
 
-def safe_text(locator):
-    """Return trimmed inner text of a locator, or empty string on failure."""
-    try:
-        txt = locator.inner_text(timeout=3000)
-        return txt.strip() if txt else ""
-    except Exception:
-        return ""
-
-
-def extract_field_by_label(page, label):
-    """Try common cvweb patterns to pull a labelled field value."""
-    # Pattern 1: <td>Label:</td><td>Value</td>  (table-based layouts)
-    try:
-        cell = page.locator(f"td:has-text('{label}')").first
-        if cell.count():
-            sibling = cell.locator("xpath=following-sibling::td[1]")
-            val = safe_text(sibling)
-            if val:
-                return val
-    except Exception:
-        pass
-
-    # Pattern 2: <span/label class="...">Label</span> … <span class="...">Value</span>
-    try:
-        lbl = page.locator(f"text='{label}'").first
-        if lbl.count():
-            parent = lbl.locator("xpath=..")
-            # grab text after the label
-            full = safe_text(parent)
-            if ":" in full:
-                return full.split(":", 1)[1].strip()
-    except Exception:
-        pass
-
-    return ""
+def split_city_state(city_state_text):
+    """Split 'City, ST' or 'City, ST 12345' into (city, state)."""
+    text = city_state_text.strip()
+    if not text:
+        return "", ""
+    # Pattern: "City, ST" or "City, ST 12345"
+    m = re.match(r"^(.+?),\s*([A-Z]{2})\b", text)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    # Fallback: just return the whole thing as city
+    return text, ""
 
 
 # ---------------------------------------------------------------------------
-# Scraping logic
+# Phase 1: Parse results table across all pages
 # ---------------------------------------------------------------------------
-def collect_member_links(page):
-    """Navigate search results and return a list of (orgcd, name) tuples."""
-    members = []
+def parse_results_table(page):
+    """
+    Parse the results table on the current page.
+    Returns a list of dicts with keys from FIELDS (Web Address empty)
+    and an extra '_detail_url' key for the detail page link.
+    """
+    records = []
+
+    # Find all data rows in the results table.
+    # The table has header row(s) and data rows. We look for rows inside
+    # <table> elements that contain <td> cells (not <th>).
+    rows = page.locator("table tr").all()
+
+    for row in rows:
+        cells = row.locator("td").all()
+        # The results table from the screenshot has 6 columns:
+        # Name | Classification | Address | City/State | Phone | Map
+        # Skip rows that don't have enough cells (headers, spacers, etc.)
+        if len(cells) < 5:
+            continue
+
+        try:
+            # Column 0: Name (with a link to detail page)
+            name_cell = cells[0]
+            name = name_cell.inner_text(timeout=3000).strip()
+
+            # Skip header rows or empty rows
+            if not name or name.lower() == "name" or name.lower() == "organization":
+                continue
+
+            # Try to get the detail page link from the name cell
+            detail_url = ""
+            link = name_cell.locator("a").first
+            if link.count():
+                href = link.get_attribute("href") or ""
+                if href:
+                    # Make absolute URL if relative
+                    if href.startswith("http"):
+                        detail_url = href
+                    elif href.startswith("/"):
+                        detail_url = "https://members.glass.org" + href
+                    else:
+                        detail_url = BASE_URL + href
+
+            # Column 1: Classification (business type)
+            classification = cells[1].inner_text(timeout=3000).strip() if len(cells) > 1 else ""
+
+            # Column 2: Address
+            address = cells[2].inner_text(timeout=3000).strip() if len(cells) > 2 else ""
+
+            # Column 3: City/State (combined, needs splitting)
+            city_state_raw = cells[3].inner_text(timeout=3000).strip() if len(cells) > 3 else ""
+            city, state = split_city_state(city_state_raw)
+
+            # Column 4: Phone
+            phone = cells[4].inner_text(timeout=3000).strip() if len(cells) > 4 else ""
+
+            record = {
+                "Name": name,
+                "Classification": classification,
+                "Address": address,
+                "City": city,
+                "State": state,
+                "Phone": phone,
+                "Web Address": "",
+                "_detail_url": detail_url,
+            }
+            records.append(record)
+
+        except Exception as exc:
+            log.warning("Failed to parse a row: %s", exc)
+            continue
+
+    return records
+
+
+def collect_all_members(page):
+    """
+    Navigate to search, submit form, and paginate through all result pages.
+    Returns a list of member dicts.
+    """
+    all_members = []
 
     log.info("Navigating to search page: %s", SEARCH_URL)
     retry(lambda: page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT))
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(3000)
 
-    # Log the page title and a snippet of the page for debugging
     title = page.title()
     log.info("Page title: %s", title)
 
-    # ----- Try to submit the search form with empty criteria -----
-    # Look for common submit button patterns
+    # ----- Submit the search form -----
     submit_selectors = [
         "input[type='submit']",
         "button[type='submit']",
@@ -123,95 +180,89 @@ def collect_member_links(page):
         "#btnSearch",
         ".btn-search",
         "input[name='submit']",
+        "input[type='image']",
     ]
 
     submitted = False
     for sel in submit_selectors:
         try:
             btn = page.locator(sel).first
-            if btn.count():
-                log.info("Found submit element: %s", sel)
+            if btn.count() and btn.is_visible():
+                log.info("Clicking submit element: %s", sel)
                 btn.click(timeout=5000)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(4000)
                 submitted = True
                 break
         except Exception:
             continue
 
     if not submitted:
-        # Fallback: try pressing Enter in the first text input
+        # Try pressing Enter on first text input
         try:
             first_input = page.locator("input[type='text']").first
             if first_input.count():
                 first_input.press("Enter")
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(4000)
                 submitted = True
-                log.info("Pressed Enter on first text input as fallback.")
+                log.info("Pressed Enter on first text input.")
         except Exception:
             pass
 
     if not submitted:
-        log.warning("Could not find a submit button. Will try to parse current page for links anyway.")
+        log.warning("Could not find submit button. Parsing current page anyway.")
 
-    # ----- Collect member links from result pages -----
+    # Take a screenshot of the results page for debugging
+    page.screenshot(path=os.path.join(OUTPUT_DIR, "results_page1.png"), full_page=True)
+
+    # ----- Paginate through all result pages -----
     page_num = 0
-    while True:
+    max_pages = 200  # safety limit
+
+    while page_num < max_pages:
         page_num += 1
         log.info("Parsing results page %d …", page_num)
 
-        # Look for organization detail links
-        # Pattern: organizationdll.dll/Info?orgcd=XXXXXX
-        links = page.locator("a[href*='organizationdll.dll/Info']").all()
-        if not links:
-            # Also try case-insensitive via evaluate
-            links = page.locator("a[href*='organizationdll']").all()
-
-        new_count = 0
-        for link in links:
-            try:
-                href = link.get_attribute("href") or ""
-                name = safe_text(link)
-                match = re.search(r"orgcd=(\d+)", href, re.IGNORECASE)
-                if match:
-                    orgcd = match.group(1)
-                    if orgcd not in {m[0] for m in members}:
-                        members.append((orgcd, name))
-                        new_count += 1
-            except Exception:
-                continue
-
-        log.info("  Found %d new member links on page %d (total: %d)", new_count, page_num, len(members))
-
-        if new_count == 0 and page_num > 1:
+        new_records = parse_results_table(page)
+        if new_records:
+            all_members.extend(new_records)
+            log.info("  Found %d members on page %d (total: %d)",
+                     len(new_records), page_num, len(all_members))
+        else:
+            log.info("  No data rows found on page %d.", page_num)
+            # If this is the first page and we found nothing, save debug info
+            if page_num == 1:
+                page.screenshot(path=os.path.join(OUTPUT_DIR, "debug_screenshot.png"), full_page=True)
+                with open(os.path.join(OUTPUT_DIR, "debug_page.html"), "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                log.error("No data found on first page. Debug files saved.")
             break
 
-        # ----- Try pagination -----
+        # ----- Navigate to next page -----
         navigated = False
 
-        # Pattern A: "Next" link / button
+        # Try clicking the → (right arrow) link for next page
+        # The screenshot shows pagination like: 1 2 3 ... 83 84 85 →
         next_selectors = [
+            "a:has-text('→')",
+            "a:has-text('›')",
+            "a:has-text('»')",
             "a:has-text('Next')",
             "a:has-text('next')",
             "a:has-text('>>')",
-            "a:has-text('>')",
-            "a.next",
-            "li.next > a",
-            "a[title='Next']",
-            "input[value='Next']",
         ]
         for sel in next_selectors:
             try:
                 nxt = page.locator(sel).first
                 if nxt.count() and nxt.is_visible():
-                    nxt.click(timeout=5000)
-                    page.wait_for_timeout(2000)
+                    nxt.click(timeout=10000)
+                    page.wait_for_timeout(3000)
                     navigated = True
-                    log.info("  Navigated via '%s'", sel)
+                    log.info("  Navigated to next page via '%s'", sel)
                     break
             except Exception:
                 continue
 
-        # Pattern B: cvweb Range-based pagination in URL
+        # Fallback: try URL Range parameter manipulation
         if not navigated:
             current_url = page.url
             range_match = re.search(r"Range=(\d+)/(\d+)", current_url, re.IGNORECASE)
@@ -225,134 +276,83 @@ def collect_member_links(page):
                     page.goto(next_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
                     page.wait_for_timeout(2000)
                     navigated = True
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.warning("  Range pagination failed: %s", exc)
 
         if not navigated:
-            log.info("No more pages to navigate.")
+            log.info("No more pages to navigate. Stopping pagination.")
             break
 
-    log.info("Total unique member links collected: %d", len(members))
-    return members
+    log.info("Total members collected from tables: %d", len(all_members))
+    return all_members
 
 
-def scrape_member_detail(page, orgcd, list_name=""):
-    """Visit a member detail page and extract fields. Returns a dict."""
-    url = MEMBER_URL_TEMPLATE.format(orgcd=orgcd)
-    record = {f: "" for f in FIELDS}
-
-    def load():
-        page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-
-    try:
-        retry(load)
-    except Exception as exc:
-        log.error("Failed to load member page orgcd=%s: %s", orgcd, exc)
-        record["Name"] = list_name
-        return record
-
-    page.wait_for_timeout(1000)
-
-    # --- Name ---
-    # Try <h1>, <h2>, or specific selectors
-    for sel in ["h1", "h2", ".org-name", "#orgName", "td.orgname"]:
-        txt = safe_text(page.locator(sel).first)
-        if txt and len(txt) < 200:
-            record["Name"] = txt
-            break
-    if not record["Name"]:
-        record["Name"] = list_name
-
-    # --- Structured extraction: scan the page body text for labelled fields ---
-    body_text = safe_text(page.locator("body"))
-
-    # Helper to pull value after a label in the body text
-    def pull(label, body=body_text):
-        pattern = rf"{re.escape(label)}\s*[:\-]?\s*(.+)"
-        m = re.search(pattern, body, re.IGNORECASE)
-        if m:
-            return m.group(1).split("\n")[0].strip()
+# ---------------------------------------------------------------------------
+# Phase 2: Visit detail pages for Web Address
+# ---------------------------------------------------------------------------
+def scrape_web_address(page, detail_url):
+    """Visit a member detail page and extract the Web Address."""
+    if not detail_url:
         return ""
 
-    # Classification (business type)
-    if not record["Classification"]:
-        record["Classification"] = extract_field_by_label(page, "Classification")
-    if not record["Classification"]:
-        record["Classification"] = extract_field_by_label(page, "Business Type")
-    if not record["Classification"]:
-        record["Classification"] = extract_field_by_label(page, "Type")
-    if not record["Classification"]:
-        record["Classification"] = pull("Classification")
-    if not record["Classification"]:
-        record["Classification"] = pull("Business Type")
+    try:
+        retry(lambda: page.goto(detail_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT))
+    except Exception as exc:
+        log.warning("  Could not load detail page %s: %s", detail_url, exc)
+        return ""
 
-    # Address
-    if not record["Address"]:
-        record["Address"] = extract_field_by_label(page, "Address")
-    if not record["Address"]:
-        record["Address"] = pull("Address")
+    page.wait_for_timeout(500)
 
-    # City
-    if not record["City"]:
-        record["City"] = extract_field_by_label(page, "City")
-    if not record["City"]:
-        record["City"] = pull("City")
+    # Strategy 1: look for a labelled "Web Address" or "Website" field
+    body_text = ""
+    try:
+        body_text = page.locator("body").inner_text(timeout=5000)
+    except Exception:
+        pass
 
-    # State
-    if not record["State"]:
-        record["State"] = extract_field_by_label(page, "State")
-    if not record["State"]:
-        record["State"] = pull("State")
+    # Try to find "Web Address:" followed by a URL in the text
+    for label in ["Web Address", "Website", "Web Site", "URL", "Home Page"]:
+        pattern = rf"{re.escape(label)}\s*[:\-]?\s*(https?://\S+)"
+        m = re.search(pattern, body_text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
 
-    # Phone
-    if not record["Phone"]:
-        record["Phone"] = extract_field_by_label(page, "Phone")
-    if not record["Phone"]:
-        record["Phone"] = pull("Phone")
-    # Fallback: find phone-number pattern in body
-    if not record["Phone"]:
-        phone_match = re.search(r"\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}", body_text)
-        if phone_match:
-            record["Phone"] = phone_match.group(0).strip()
+    # Strategy 2: look for td label / td value pattern
+    for label in ["Web Address", "Website", "Web Site", "URL"]:
+        try:
+            cells = page.locator(f"td:has-text('{label}')").all()
+            for cell in cells:
+                sibling = cell.locator("xpath=following-sibling::td[1]")
+                if sibling.count():
+                    # Check for a link inside the sibling
+                    link = sibling.locator("a").first
+                    if link.count():
+                        href = link.get_attribute("href") or ""
+                        if href and href.startswith("http"):
+                            return href
+                    # Or just get text
+                    txt = sibling.inner_text(timeout=2000).strip()
+                    if txt and ("." in txt) and (" " not in txt):
+                        if not txt.startswith("http"):
+                            txt = "http://" + txt
+                        return txt
+        except Exception:
+            continue
 
-    # Web Address
-    if not record["Web Address"]:
-        record["Web Address"] = extract_field_by_label(page, "Web Address")
-    if not record["Web Address"]:
-        record["Web Address"] = extract_field_by_label(page, "Website")
-    if not record["Web Address"]:
-        record["Web Address"] = extract_field_by_label(page, "URL")
-    if not record["Web Address"]:
-        record["Web Address"] = pull("Web Address")
-    if not record["Web Address"]:
-        record["Web Address"] = pull("Website")
-    # Fallback: find a link that looks like a member website
-    if not record["Web Address"]:
-        ext_links = page.locator("a[href^='http']").all()
-        for lnk in ext_links:
-            try:
-                href = lnk.get_attribute("href") or ""
-                if "glass.org" not in href and "mailto:" not in href and href.startswith("http"):
-                    record["Web Address"] = href
-                    break
-            except Exception:
-                continue
+    # Strategy 3: find any external link that doesn't point to glass.org
+    try:
+        all_links = page.locator("a[href^='http']").all()
+        for lnk in all_links:
+            href = lnk.get_attribute("href") or ""
+            if href and "glass.org" not in href and "mailto:" not in href:
+                # Check it looks like a real website, not a social/map link
+                if any(skip in href.lower() for skip in ["google.com/maps", "facebook.com", "twitter.com", "linkedin.com"]):
+                    continue
+                return href
+    except Exception:
+        pass
 
-    # --- Try to parse address block if city/state still empty ---
-    # cvweb often puts address in a single block; try to split
-    if record["Address"] and not record["City"]:
-        # Look for "City, ST ZIP" pattern after address
-        addr_pattern = re.search(
-            r"([A-Za-z\s]+),\s*([A-Z]{2})\s+(\d{5})",
-            body_text[body_text.find(record["Address"]):]
-        )
-        if addr_pattern:
-            record["City"] = addr_pattern.group(1).strip()
-            record["State"] = addr_pattern.group(2).strip()
-
-    log.info("  Scraped: %s | %s | %s, %s",
-             record["Name"], record["Classification"], record["City"], record["State"])
-    return record
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +361,7 @@ def scrape_member_detail(page, orgcd, list_name=""):
 def export_csv(records):
     """Write records to CSV."""
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDS)
+        writer = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(records)
     log.info("CSV saved to %s (%d rows)", CSV_FILE, len(records))
@@ -401,44 +401,52 @@ def main():
         )
         page = context.new_page()
 
-        # Phase 1 – collect all member links from search results
-        member_links = collect_member_links(page)
+        # Phase 1 – collect members from results table
+        members = collect_all_members(page)
 
-        if not member_links:
-            log.error("No member links found. Saving debug screenshot.")
-            page.screenshot(path=os.path.join(OUTPUT_DIR, "debug_screenshot.png"), full_page=True)
-            # Save page HTML for debugging
-            with open(os.path.join(OUTPUT_DIR, "debug_page.html"), "w", encoding="utf-8") as f:
-                f.write(page.content())
+        if not members:
+            log.error("No members found. Check debug files in output/.")
             browser.close()
             return
 
-        # Phase 2 – visit each member detail page
-        records = []
-        total = len(member_links)
-        failed = 0
-        for idx, (orgcd, name) in enumerate(member_links, 1):
-            log.info("[%d/%d] Scraping orgcd=%s (%s) …", idx, total, orgcd, name)
+        # Phase 2 – visit detail pages for Web Address
+        total = len(members)
+        log.info("=" * 60)
+        log.info("Phase 2: Fetching Web Address from %d detail pages …", total)
+        log.info("=" * 60)
+        web_found = 0
+        web_failed = 0
+        for idx, member in enumerate(members, 1):
+            detail_url = member.get("_detail_url", "")
+            if not detail_url:
+                web_failed += 1
+                continue
+
+            log.info("[%d/%d] %s", idx, total, member["Name"])
             try:
-                rec = scrape_member_detail(page, orgcd, list_name=name)
-                records.append(rec)
+                web = scrape_web_address(page, detail_url)
+                member["Web Address"] = web
+                if web:
+                    web_found += 1
+                    log.info("  Web: %s", web)
+                else:
+                    log.info("  No web address found.")
             except Exception as exc:
-                log.error("  FAILED orgcd=%s: %s", orgcd, exc)
-                failed += 1
-                records.append({f: "" for f in FIELDS})
-                records[-1]["Name"] = name
+                log.warning("  Error fetching web address: %s", exc)
+                web_failed += 1
 
             if idx < total:
-                time.sleep(REQUEST_DELAY)
+                time.sleep(DETAIL_DELAY)
 
         browser.close()
 
     # Phase 3 – export
-    export_csv(records)
-    export_xlsx(records)
+    export_csv(members)
+    export_xlsx(members)
 
     log.info("=" * 60)
-    log.info("DONE — Total: %d | Scraped: %d | Failed: %d", total, total - failed, failed)
+    log.info("DONE — Members: %d | Web addresses found: %d | Failed: %d",
+             total, web_found, web_failed)
     log.info("=" * 60)
 
 
